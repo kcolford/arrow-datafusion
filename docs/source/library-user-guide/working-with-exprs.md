@@ -19,7 +19,7 @@
 
 # Working with `Expr`s
 
-<!-- https://github.com/apache/arrow-datafusion/issues/7304 -->
+<!-- https://github.com/apache/datafusion/issues/7304 -->
 
 `Expr` is short for "expression". It is a core abstraction in DataFusion for representing a computation, and follows the standard "expression tree" abstraction found in most compilers and databases.
 
@@ -52,7 +52,7 @@ As the writer of a library, you can use `Expr`s to represent computations that y
 
 ## Creating and Evaluating `Expr`s
 
-Please see [expr_api.rs](https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/expr_api.rs) for well commented code for creating, evaluating, simplifying, and analyzing `Expr`s.
+Please see [expr_api.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/expr_api.rs) for well commented code for creating, evaluating, simplifying, and analyzing `Expr`s.
 
 ## A Scalar UDF Example
 
@@ -61,12 +61,34 @@ We'll use a `ScalarUDF` expression as our example. This necessitates implementin
 So assuming you've written that function, you can use it to create an `Expr`:
 
 ```rust
+# use std::sync::Arc;
+# use datafusion::arrow::array::{ArrayRef, Int64Array};
+# use datafusion::common::cast::as_int64_array;
+# use datafusion::common::Result;
+# use datafusion::logical_expr::ColumnarValue;
+#
+# pub fn add_one(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+#     // Error handling omitted for brevity
+#     let args = ColumnarValue::values_to_arrays(args)?;
+#     let i64s = as_int64_array(&args[0])?;
+#
+#     let new_array = i64s
+#         .iter()
+#         .map(|array_elem| array_elem.map(|value| value + 1))
+#         .collect::<Int64Array>();
+#
+#     Ok(ColumnarValue::from(Arc::new(new_array) as ArrayRef))
+# }
+use datafusion::logical_expr::{Volatility, create_udf};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::{col, lit};
+
 let add_one_udf = create_udf(
     "add_one",
     vec![DataType::Int64],
-    Arc::new(DataType::Int64),
+    DataType::Int64,
     Volatility::Immutable,
-    make_scalar_function(add_one),  // <-- the function we wrote
+    Arc::new(add_one),
 );
 
 // make the expr `add_one(5)`
@@ -80,7 +102,11 @@ If you'd like to learn more about `Expr`s, before we get into the details of cre
 
 ## Rewriting `Expr`s
 
-[rewrite_expr.rs](https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/rewrite_expr.rs) contains example code for rewriting `Expr`s.
+There are several examples of rewriting and working with `Exprs`:
+
+- [expr_api.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/expr_api.rs)
+- [analyzer_rule.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/analyzer_rule.rs)
+- [optimizer_rule.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/optimizer_rule.rs)
 
 Rewriting Expressions is the process of taking an `Expr` and transforming it into another `Expr`. This is useful for a number of reasons, including:
 
@@ -92,19 +118,24 @@ In our example, we'll use rewriting to update our `add_one` UDF, to be rewritten
 
 ### Rewriting with `transform`
 
-To implement the inlining, we'll need to write a function that takes an `Expr` and returns a `Result<Expr>`. If the expression is _not_ to be rewritten `Transformed::No` is used to wrap the original `Expr`. If the expression _is_ to be rewritten, `Transformed::Yes` is used to wrap the new `Expr`.
+To implement the inlining, we'll need to write a function that takes an `Expr` and returns a `Result<Expr>`. If the expression is _not_ to be rewritten `Transformed::no` is used to wrap the original `Expr`. If the expression _is_ to be rewritten, `Transformed::yes` is used to wrap the new `Expr`.
 
 ```rust
-fn rewrite_add_one(expr: Expr) -> Result<Expr> {
+use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::logical_expr::{ScalarUDF};
+
+fn rewrite_add_one(expr: Expr) -> Result<Transformed<Expr>> {
     expr.transform(&|expr| {
         Ok(match expr {
-            Expr::ScalarUDF(scalar_fun) if scalar_fun.fun.name == "add_one" => {
-                let input_arg = scalar_fun.args[0].clone();
+            Expr::ScalarFunction(scalar_func) if scalar_func.func.inner().name() == "add_one" => {
+                let input_arg = scalar_func.args[0].clone();
                 let new_expression = input_arg + lit(1i64);
 
-                Transformed::Yes(new_expression)
+                Transformed::yes(new_expression)
             }
-            _ => Transformed::No(expr),
+            _ => Transformed::no(expr),
         })
     })
 }
@@ -120,6 +151,27 @@ We'll call our rule `AddOneInliner` and implement the `OptimizerRule` trait. The
 - `try_optimize` - takes a `LogicalPlan` and returns an `Option<LogicalPlan>`. If the rule is able to optimize the plan, it returns `Some(LogicalPlan)` with the optimized plan. If the rule is not able to optimize the plan, it returns `None`.
 
 ```rust
+use std::sync::Arc;
+use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::optimizer::{OptimizerRule, OptimizerConfig, OptimizerContext, Optimizer};
+
+# fn rewrite_add_one(expr: Expr) -> Result<Transformed<Expr>> {
+#     expr.transform(&|expr| {
+#         Ok(match expr {
+#             Expr::ScalarFunction(scalar_func) if scalar_func.func.inner().name() == "add_one" => {
+#                 let input_arg = scalar_func.args[0].clone();
+#                 let new_expression = input_arg + lit(1i64);
+#
+#                 Transformed::yes(new_expression)
+#             }
+#             _ => Transformed::no(expr),
+#         })
+#     })
+# }
+
+#[derive(Default, Debug)]
 struct AddOneInliner {}
 
 impl OptimizerRule for AddOneInliner {
@@ -127,23 +179,26 @@ impl OptimizerRule for AddOneInliner {
         "add_one_inliner"
     }
 
-    fn try_optimize(
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
-        config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
         // Map over the expressions and rewrite them
-        let new_expressions = plan
+        let new_expressions: Vec<Expr> = plan
             .expressions()
             .into_iter()
             .map(|expr| rewrite_add_one(expr))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()? // returns Vec<Transformed<Expr>>
+            .into_iter()
+            .map(|transformed| transformed.data)
+            .collect();
 
         let inputs = plan.inputs().into_iter().cloned().collect::<Vec<_>>();
 
-        let plan = plan.with_new_exprs(&new_expressions, &inputs);
+        let plan: Result<LogicalPlan> = plan.with_new_exprs(new_expressions, inputs);
 
-        plan.map(Some)
+        plan.map(|p| Transformed::yes(p))
     }
 }
 ```
@@ -157,25 +212,111 @@ We're almost there. Let's just test our rule works properly.
 Testing the rule is fairly simple, we can create a SessionState with our rule and then create a DataFrame and run a query. The logical plan will be optimized by our rule.
 
 ```rust
-use datafusion::prelude::*;
+# use std::sync::Arc;
+# use datafusion::common::Result;
+# use datafusion::common::tree_node::{Transformed, TreeNode};
+# use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
+# use datafusion::optimizer::{OptimizerRule, OptimizerConfig, OptimizerContext, Optimizer};
+# use datafusion::arrow::array::{ArrayRef, Int64Array};
+# use datafusion::common::cast::as_int64_array;
+# use datafusion::logical_expr::ColumnarValue;
+# use datafusion::logical_expr::{Volatility, create_udf};
+# use datafusion::arrow::datatypes::DataType;
+#
+# fn rewrite_add_one(expr: Expr) -> Result<Transformed<Expr>> {
+#     expr.transform(&|expr| {
+#         Ok(match expr {
+#             Expr::ScalarFunction(scalar_func) if scalar_func.func.inner().name() == "add_one" => {
+#                 let input_arg = scalar_func.args[0].clone();
+#                 let new_expression = input_arg + lit(1i64);
+#
+#                 Transformed::yes(new_expression)
+#             }
+#             _ => Transformed::no(expr),
+#         })
+#     })
+# }
+#
+# #[derive(Default, Debug)]
+# struct AddOneInliner {}
+#
+# impl OptimizerRule for AddOneInliner {
+#     fn name(&self) -> &str {
+#         "add_one_inliner"
+#     }
+#
+#     fn rewrite(
+#         &self,
+#         plan: LogicalPlan,
+#         _config: &dyn OptimizerConfig,
+#     ) -> Result<Transformed<LogicalPlan>> {
+#         // Map over the expressions and rewrite them
+#         let new_expressions: Vec<Expr> = plan
+#             .expressions()
+#             .into_iter()
+#             .map(|expr| rewrite_add_one(expr))
+#             .collect::<Result<Vec<_>>>()? // returns Vec<Transformed<Expr>>
+#             .into_iter()
+#             .map(|transformed| transformed.data)
+#             .collect();
+#
+#         let inputs = plan.inputs().into_iter().cloned().collect::<Vec<_>>();
+#
+#         let plan: Result<LogicalPlan> = plan.with_new_exprs(new_expressions, inputs);
+#
+#         plan.map(|p| Transformed::yes(p))
+#     }
+# }
+#
+# pub fn add_one(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+#     // Error handling omitted for brevity
+#     let args = ColumnarValue::values_to_arrays(args)?;
+#     let i64s = as_int64_array(&args[0])?;
+#
+#     let new_array = i64s
+#         .iter()
+#         .map(|array_elem| array_elem.map(|value| value + 1))
+#         .collect::<Int64Array>();
+#
+#     Ok(ColumnarValue::from(Arc::new(new_array) as ArrayRef))
+# }
 
-let rules = Arc::new(AddOneInliner {});
-let state = ctx.state().with_optimizer_rules(vec![rules]);
+use datafusion::execution::context::SessionContext;
 
-let ctx = SessionContext::with_state(state);
-ctx.register_udf(add_one);
+#[tokio::main]
+async fn main() -> Result<()> {
 
-let sql = "SELECT add_one(1) AS added_one";
-let plan = ctx.sql(sql).await?.logical_plan();
+    let ctx = SessionContext::new();
+    // ctx.add_optimizer_rule(Arc::new(AddOneInliner {}));
 
-println!("{:?}", plan);
+    let add_one_udf = create_udf(
+        "add_one",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(add_one),
+    );
+    ctx.register_udf(add_one_udf);
+
+    let sql = "SELECT add_one(5) AS added_one";
+    // let plan = ctx.sql(sql).await?.into_unoptimized_plan().clone();
+    let plan = ctx.sql(sql).await?.into_optimized_plan()?.clone();
+
+    let expected = r#"Projection: Int64(6) AS added_one
+  EmptyRelation"#;
+
+    assert_eq!(plan.to_string(), expected);
+
+    Ok(())
+}
 ```
 
-This results in the following output:
+This plan is optimized as:
 
 ```text
-Projection: Int64(1) + Int64(1) AS added_one
-  EmptyRelation
+Projection: add_one(Int64(5)) AS added_one
+    -> Projection: Int64(5) + Int64(1) AS added_one
+        -> Projection: Int64(6) AS added_one
 ```
 
 I.e. the `add_one` UDF has been inlined into the projection.
@@ -185,27 +326,23 @@ I.e. the `add_one` UDF has been inlined into the projection.
 The `arrow::datatypes::DataType` of the expression can be obtained by calling the `get_type` given something that implements `Expr::Schemable`, for example a `DFschema` object:
 
 ```rust
-use arrow_schema::DataType;
-use datafusion::common::{DFField, DFSchema};
+use arrow::datatypes::{DataType, Field};
+use datafusion::common::DFSchema;
 use datafusion::logical_expr::{col, ExprSchemable};
 use std::collections::HashMap;
 
+// Get the type of an expression that adds 2 columns. Adding an Int32
+// and Float32 results in Float32 type
 let expr = col("c1") + col("c2");
-let schema = DFSchema::new_with_metadata(
+let schema = DFSchema::from_unqualified_fields(
     vec![
-        DFField::new_unqualified("c1", DataType::Int32, true),
-        DFField::new_unqualified("c2", DataType::Float32, true),
-    ],
+        Field::new("c1", DataType::Int32, true),
+        Field::new("c2", DataType::Float32, true),
+    ]
+    .into(),
     HashMap::new(),
-)
-.unwrap();
-print!("type = {}", expr.get_type(&schema).unwrap());
-```
-
-This results in the following output:
-
-```text
-type = Float32
+).unwrap();
+assert_eq!("Float32", format!("{}", expr.get_type(&schema).unwrap()));
 ```
 
 ## Conclusion

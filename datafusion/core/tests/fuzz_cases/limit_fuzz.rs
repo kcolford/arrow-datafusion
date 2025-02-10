@@ -17,10 +17,9 @@
 
 //! Fuzz Test for Sort + Fetch/Limit (TopK!)
 
+use arrow::array::{Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::concat_batches;
 use arrow::util::pretty::pretty_format_batches;
-use arrow::{array::Int32Array, record_batch::RecordBatch};
-use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::SchemaRef;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -226,7 +225,7 @@ impl SortedData {
     }
 
     /// Return the sort expression to use for this data, depending on the type
-    fn sort_expr(&self) -> Vec<datafusion_expr::Expr> {
+    fn sort_expr(&self) -> Vec<datafusion_expr::SortExpr> {
         match self {
             Self::I32 { .. } | Self::F64 { .. } | Self::Str { .. } => {
                 vec![datafusion_expr::col("x").sort(true, true)]
@@ -281,7 +280,7 @@ fn i64string_batch<'a>(
     .unwrap()
 }
 
-/// Run the TopK test, sorting the input batches with the specified ftch
+/// Run the TopK test, sorting the input batches with the specified fetch
 /// (limit) and compares the results to the expected values.
 async fn run_limit_test(fetch: usize, data: &SortedData) {
     let input = data.batches();
@@ -341,7 +340,7 @@ async fn run_limit_test(fetch: usize, data: &SortedData) {
 
 /// Return random ASCII String with len
 fn get_random_string(len: usize) -> String {
-    rand::thread_rng()
+    thread_rng()
         .sample_iter(rand::distributions::Alphanumeric)
         .take(len)
         .map(char::from)

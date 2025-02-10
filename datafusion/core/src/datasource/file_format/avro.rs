@@ -18,22 +18,72 @@
 //! [`AvroFormat`] Apache Avro [`FileFormat`] abstractions
 
 use std::any::Any;
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
+use super::file_compression_type::FileCompressionType;
+use super::FileFormat;
+use super::FileFormatFactory;
+use crate::datasource::avro_to_arrow::read_avro_schema_from_reader;
+use crate::datasource::physical_plan::{AvroSource, FileScanConfig};
+use crate::error::Result;
+use crate::physical_plan::ExecutionPlan;
+use crate::physical_plan::Statistics;
+
+use crate::datasource::data_source::FileSource;
 use arrow::datatypes::Schema;
-use arrow::{self, datatypes::SchemaRef};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion_common::FileType;
+use datafusion_catalog::Session;
+use datafusion_common::internal_err;
+use datafusion_common::parsers::CompressionTypeVariant;
+use datafusion_common::GetExt;
+use datafusion_common::DEFAULT_AVRO_EXTENSION;
 use datafusion_physical_expr::PhysicalExpr;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
-use super::FileFormat;
-use crate::datasource::avro_to_arrow::read_avro_schema_from_reader;
-use crate::datasource::physical_plan::{AvroExec, FileScanConfig};
-use crate::error::Result;
-use crate::execution::context::SessionState;
-use crate::physical_plan::ExecutionPlan;
-use crate::physical_plan::Statistics;
+#[derive(Default)]
+/// Factory struct used to create [AvroFormat]
+pub struct AvroFormatFactory;
+
+impl AvroFormatFactory {
+    /// Creates an instance of [AvroFormatFactory]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl FileFormatFactory for AvroFormatFactory {
+    fn create(
+        &self,
+        _state: &dyn Session,
+        _format_options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn FileFormat>> {
+        Ok(Arc::new(AvroFormat))
+    }
+
+    fn default(&self) -> Arc<dyn FileFormat> {
+        Arc::new(AvroFormat)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl fmt::Debug for AvroFormatFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AvroFormatFactory").finish()
+    }
+}
+
+impl GetExt for AvroFormatFactory {
+    fn get_ext(&self) -> String {
+        // Removes the dot, i.e. ".parquet" -> "parquet"
+        DEFAULT_AVRO_EXTENSION[1..].to_string()
+    }
+}
 
 /// Avro `FileFormat` implementation.
 #[derive(Default, Debug)]
@@ -45,9 +95,24 @@ impl FileFormat for AvroFormat {
         self
     }
 
+    fn get_ext(&self) -> String {
+        AvroFormatFactory::new().get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String> {
+        let ext = self.get_ext();
+        match file_compression_type.get_variant() {
+            CompressionTypeVariant::UNCOMPRESSED => Ok(ext),
+            _ => internal_err!("Avro FileFormat does not support compression."),
+        }
+    }
+
     async fn infer_schema(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
@@ -72,7 +137,7 @@ impl FileFormat for AvroFormat {
 
     async fn infer_stats(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _store: &Arc<dyn ObjectStore>,
         table_schema: SchemaRef,
         _object: &ObjectMeta,
@@ -82,16 +147,16 @@ impl FileFormat for AvroFormat {
 
     async fn create_physical_plan(
         &self,
-        _state: &SessionState,
-        conf: FileScanConfig,
+        _state: &dyn Session,
+        mut conf: FileScanConfig,
         _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let exec = AvroExec::new(conf);
-        Ok(Arc::new(exec))
+        conf = conf.with_source(self.file_source());
+        Ok(conf.new_exec())
     }
 
-    fn file_type(&self) -> FileType {
-        FileType::AVRO
+    fn file_source(&self) -> Arc<dyn FileSource> {
+        Arc::new(AvroSource::new())
     }
 }
 
@@ -440,7 +505,7 @@ mod tests {
     }
 
     async fn get_exec(
-        state: &SessionState,
+        state: &dyn Session,
         file_name: &str,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,

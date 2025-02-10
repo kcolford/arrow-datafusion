@@ -21,7 +21,7 @@ use criterion::{BatchSize, Criterion};
 extern crate arrow;
 extern crate datafusion;
 
-use std::{iter::FromIterator, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -33,11 +33,12 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::{
     collect,
     expressions::{col, PhysicalSortExpr},
-    memory::MemoryExec,
+    memory::MemorySourceConfig,
 };
 use datafusion::prelude::SessionContext;
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
-// Initialise the operator using the provided record batches and the sort key
+// Initialize the operator using the provided record batches and the sort key
 // as inputs. All record batches must have the same schema.
 fn sort_preserving_merge_operator(
     session_ctx: Arc<SessionContext>,
@@ -52,15 +53,15 @@ fn sort_preserving_merge_operator(
             expr: col(name, &schema).unwrap(),
             options: Default::default(),
         })
-        .collect::<Vec<_>>();
+        .collect::<LexOrdering>();
 
-    let exec = MemoryExec::try_new(
+    let exec = MemorySourceConfig::try_new_exec(
         &batches.into_iter().map(|rb| vec![rb]).collect::<Vec<_>>(),
         schema,
         None,
     )
     .unwrap();
-    let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
+    let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
     let task_ctx = session_ctx.task_ctx();
     let rt = Runtime::new().unwrap();
     rt.block_on(collect(merge, task_ctx)).unwrap();

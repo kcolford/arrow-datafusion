@@ -21,7 +21,7 @@
 //! 1. Creates a list of tuples (sorted if necessary)
 //!
 //! 2. Divides those tuples across some number of streams of [`RecordBatch`]
-//! preserving any ordering
+//!    preserving any ordering
 //!
 //! 3. Times how long it takes for a given sort plan to process the input
 //!
@@ -68,33 +68,32 @@
 
 use std::sync::Arc;
 
-use arrow::array::DictionaryArray;
-use arrow::datatypes::Int32Type;
 use arrow::{
-    array::{Float64Array, Int64Array, StringArray},
+    array::{DictionaryArray, Float64Array, Int64Array, StringArray},
     compute::SortOptions,
-    datatypes::Schema,
+    datatypes::{Int32Type, Schema},
     record_batch::RecordBatch,
 };
 
-/// Benchmarks for SortPreservingMerge stream
-use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::{
     execution::context::TaskContext,
     physical_plan::{
-        memory::MemoryExec, sorts::sort_preserving_merge::SortPreservingMergeExec,
-        ExecutionPlan,
+        coalesce_partitions::CoalescePartitionsExec, memory::MemorySourceConfig,
+        sorts::sort_preserving_merge::SortPreservingMergeExec, ExecutionPlan,
+        ExecutionPlanProperties,
     },
     prelude::SessionContext,
 };
 use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
+
+/// Benchmarks for SortPreservingMerge stream
+use criterion::{criterion_group, criterion_main, Criterion};
 use futures::StreamExt;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::runtime::Runtime;
-
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
 /// Total number of streams to divide each input into
 /// models 8 partition plan (should it be 16??)
@@ -168,8 +167,8 @@ impl BenchCase {
         let schema = partitions[0][0].schema();
         let sort = make_sort_exprs(schema.as_ref());
 
-        let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let plan = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
+        let exec = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
+        let plan = Arc::new(SortPreservingMergeExec::new(sort, exec));
 
         Self {
             runtime,
@@ -187,9 +186,8 @@ impl BenchCase {
         let schema = partitions[0][0].schema();
         let sort = make_sort_exprs(schema.as_ref());
 
-        let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let exec =
-            SortExec::new(sort.clone(), Arc::new(exec)).with_preserve_partitioning(true);
+        let source = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
+        let exec = SortExec::new(sort.clone(), source).with_preserve_partitioning(true);
         let plan = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
 
         Self {
@@ -209,8 +207,8 @@ impl BenchCase {
         let schema = partitions[0][0].schema();
         let sort = make_sort_exprs(schema.as_ref());
 
-        let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let exec = Arc::new(CoalescePartitionsExec::new(Arc::new(exec)));
+        let exec = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
+        let exec = Arc::new(CoalescePartitionsExec::new(exec));
         let plan = Arc::new(SortExec::new(sort, exec));
 
         Self {
@@ -230,8 +228,8 @@ impl BenchCase {
         let schema = partitions[0][0].schema();
         let sort = make_sort_exprs(schema.as_ref());
 
-        let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let exec = SortExec::new(sort, Arc::new(exec)).with_preserve_partitioning(true);
+        let source = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
+        let exec = SortExec::new(sort, source).with_preserve_partitioning(true);
         let plan = Arc::new(CoalescePartitionsExec::new(Arc::new(exec)));
 
         Self {
@@ -259,7 +257,7 @@ impl BenchCase {
 }
 
 /// Make sort exprs for each column in `schema`
-fn make_sort_exprs(schema: &Schema) -> Vec<PhysicalSortExpr> {
+fn make_sort_exprs(schema: &Schema) -> LexOrdering {
     schema
         .fields()
         .iter()

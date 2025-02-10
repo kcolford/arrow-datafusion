@@ -19,22 +19,17 @@
 
 use crate::aggregates::topk::hash_table::{new_hash_table, ArrowHashTable};
 use crate::aggregates::topk::heap::{new_heap, ArrowHeap};
-use arrow_array::ArrayRef;
+use arrow::array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion_common::Result;
 
 /// A `Map<K, V>` / `PriorityQueue` combo that evicts the worst values after reaching `capacity`
 pub struct PriorityMap {
-    map: Box<dyn ArrowHashTable>,
-    heap: Box<dyn ArrowHeap>,
+    map: Box<dyn ArrowHashTable + Send>,
+    heap: Box<dyn ArrowHeap + Send>,
     capacity: usize,
     mapper: Vec<(usize, usize)>,
 }
-
-// JUSTIFICATION
-//  Benefit:  ~15% speedup + required to index into RawTable from binary heap
-//  Soundness: it is only accessed by one thread at a time, and indexes are kept up to date
-unsafe impl Send for PriorityMap {}
 
 impl PriorityMap {
     pub fn new(
@@ -113,12 +108,11 @@ impl PriorityMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::util::pretty::pretty_format_batches;
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::Field;
     use arrow_schema::Schema;
-    use arrow_schema::{DataType, SchemaRef};
-    use datafusion_common::Result;
+    use arrow_schema::SchemaRef;
     use std::sync::Arc;
 
     #[test]

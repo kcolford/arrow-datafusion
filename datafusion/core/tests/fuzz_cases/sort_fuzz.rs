@@ -17,28 +17,31 @@
 
 //! Fuzz Test for various corner cases sorting RecordBatches exceeds available memory and should spill
 
+use std::sync::Arc;
+
 use arrow::{
     array::{ArrayRef, Int32Array},
     compute::SortOptions,
     record_batch::RecordBatch,
 };
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
-use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_execution::memory_pool::GreedyMemoryPool;
 use datafusion_physical_expr::expressions::col;
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_plan::memory::MemorySourceConfig;
+
 use rand::Rng;
-use std::sync::Arc;
 use test_utils::{batches_to_vec, partitions_to_sorted_vec};
 
 const KB: usize = 1 << 10;
 #[tokio::test]
 #[cfg_attr(tarpaulin, ignore)]
-async fn test_sort_1k_mem() {
-    for (batch_size, should_spill) in [(5, false), (20000, true), (1000000, true)] {
+async fn test_sort_10k_mem() {
+    for (batch_size, should_spill) in [(5, false), (20000, true), (500000, true)] {
         SortTest::new()
             .with_int32_batches(batch_size)
             .with_pool_size(10 * KB)
@@ -92,7 +95,7 @@ impl SortTest {
         self
     }
 
-    /// specify that this test should use a memory pool of the specifeid size
+    /// specify that this test should use a memory pool of the specified size
     fn with_pool_size(mut self, pool_size: usize) -> Self {
         self.pool_size = Some(pool_size);
         self
@@ -114,16 +117,16 @@ impl SortTest {
             .expect("at least one batch");
         let schema = first_batch.schema();
 
-        let sort = vec![PhysicalSortExpr {
+        let sort = LexOrdering::new(vec![PhysicalSortExpr {
             expr: col("x", &schema).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: true,
             },
-        }];
+        }]);
 
-        let exec = MemoryExec::try_new(&input, schema, None).unwrap();
-        let sort = Arc::new(SortExec::new(sort, Arc::new(exec)));
+        let exec = MemorySourceConfig::try_new_exec(&input, schema, None).unwrap();
+        let sort = Arc::new(SortExec::new(sort, exec));
 
         let session_config = SessionConfig::new();
         let session_ctx = if let Some(pool_size) = self.pool_size {
@@ -136,9 +139,10 @@ impl SortTest {
                     .sort_spill_reservation_bytes,
             );
 
-            let runtime_config = RuntimeConfig::new()
-                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)));
-            let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)))
+                .build_arc()
+                .unwrap();
             SessionContext::new_with_config_rt(session_config, runtime)
         } else {
             SessionContext::new_with_config(session_config)

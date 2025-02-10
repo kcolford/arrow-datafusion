@@ -24,13 +24,12 @@
 use std::collections::VecDeque;
 use std::mem;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use crate::datasource::listing::PartitionedFile;
-use crate::datasource::physical_plan::{
-    FileMeta, FileScanConfig, PartitionColumnProjector,
-};
+use crate::datasource::physical_plan::file_scan_config::PartitionColumnProjector;
+use crate::datasource::physical_plan::{FileMeta, FileScanConfig};
 use crate::error::Result;
 use crate::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, Time,
@@ -40,6 +39,7 @@ use crate::physical_plan::RecordBatchStream;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::instant::Instant;
 use datafusion_common::ScalarValue;
 
 use futures::future::BoxFuture;
@@ -68,14 +68,14 @@ impl Default for OnError {
 /// stream of [`RecordBatch`]
 ///
 /// [`ObjectStore`]: object_store::ObjectStore
-pub trait FileOpener: Unpin {
+pub trait FileOpener: Unpin + Send + Sync {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]
     fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture>;
 }
 
 /// A stream that iterates record batch by record batch, file over file.
-pub struct FileStream<F: FileOpener> {
+pub struct FileStream {
     /// An iterator over input files.
     file_iter: VecDeque<PartitionedFile>,
     /// The stream schema (file schema including partition columns and after
@@ -83,9 +83,9 @@ pub struct FileStream<F: FileOpener> {
     projected_schema: SchemaRef,
     /// The remaining number of records to parse, None if no limit
     remain: Option<usize>,
-    /// A generic [`FileOpener`]. Calling `open()` returns a [`FileOpenFuture`],
+    /// A dynamic [`FileOpener`]. Calling `open()` returns a [`FileOpenFuture`],
     /// which can be resolved to a stream of `RecordBatch`.
-    file_opener: F,
+    file_opener: Arc<dyn FileOpener>,
     /// The partition column projector
     pc_projector: PartitionColumnProjector,
     /// The stream state
@@ -177,7 +177,7 @@ struct FileStreamMetrics {
     /// Time between when the [`FileStream`] requests data from the
     /// stream and when the first [`RecordBatch`] is produced.
     pub time_scanning_until_data: StartableTime,
-    /// Total elapsed wall clock time for for scanning + record batch decompression / decoding
+    /// Total elapsed wall clock time for scanning + record batch decompression / decoding
     ///
     /// Sum of time between when the [`FileStream`] requests data from
     /// the stream and when a [`RecordBatch`] is produced for all
@@ -243,17 +243,17 @@ impl FileStreamMetrics {
     }
 }
 
-impl<F: FileOpener> FileStream<F> {
+impl FileStream {
     /// Create a new `FileStream` using the give `FileOpener` to scan underlying files
     pub fn new(
         config: &FileScanConfig,
         partition: usize,
-        file_opener: F,
+        file_opener: Arc<dyn FileOpener>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let (projected_schema, ..) = config.project();
         let pc_projector = PartitionColumnProjector::new(
-            projected_schema.clone(),
+            Arc::clone(&projected_schema),
             &config
                 .table_partition_cols
                 .iter()
@@ -296,6 +296,7 @@ impl<F: FileOpener> FileStream<F> {
             object_meta: part_file.object_meta,
             range: part_file.range,
             extensions: part_file.extensions,
+            metadata_size_hint: part_file.metadata_size_hint,
         };
 
         Some(
@@ -494,7 +495,7 @@ impl<F: FileOpener> FileStream<F> {
     }
 }
 
-impl<F: FileOpener> Stream for FileStream<F> {
+impl Stream for FileStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
@@ -508,9 +509,9 @@ impl<F: FileOpener> Stream for FileStream<F> {
     }
 }
 
-impl<F: FileOpener> RecordBatchStream for FileStream<F> {
+impl RecordBatchStream for FileStream {
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 }
 
@@ -520,21 +521,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::datasource::file_format::write::BatchSerializer;
     use crate::datasource::object_store::ObjectStoreUrl;
-    use crate::datasource::physical_plan::FileMeta;
-    use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
     use crate::prelude::SessionContext;
-    use crate::{
-        error::Result,
-        test::{make_partition, object_store::register_test_store},
-    };
+    use crate::test::{make_partition, object_store::register_test_store};
 
+    use crate::datasource::physical_plan::CsvSource;
     use arrow_schema::Schema;
-    use datafusion_common::{internal_err, DataFusionError, Statistics};
-
-    use bytes::Bytes;
-    use futures::StreamExt;
+    use datafusion_common::internal_err;
 
     /// Test `FileOpener` which will simulate errors during file opening or scanning
     #[derive(Default)]
@@ -653,20 +646,18 @@ mod tests {
 
             let on_error = self.on_error;
 
-            let config = FileScanConfig {
-                object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-                statistics: Statistics::new_unknown(&file_schema),
+            let config = FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
                 file_schema,
-                file_groups: vec![file_group],
-                projection: None,
-                limit: self.limit,
-                table_partition_cols: vec![],
-                output_ordering: vec![],
-            };
+                Arc::new(CsvSource::default()),
+            )
+            .with_file_group(file_group)
+            .with_limit(self.limit);
             let metrics_set = ExecutionPlanMetricsSet::new();
-            let file_stream = FileStream::new(&config, 0, self.opener, &metrics_set)
-                .unwrap()
-                .with_on_error(on_error);
+            let file_stream =
+                FileStream::new(&config, 0, Arc::new(self.opener), &metrics_set)
+                    .unwrap()
+                    .with_on_error(on_error);
 
             file_stream
                 .collect::<Vec<_>>()
@@ -980,15 +971,5 @@ mod tests {
         ], &batches);
 
         Ok(())
-    }
-
-    struct TestSerializer {
-        bytes: Bytes,
-    }
-
-    impl BatchSerializer for TestSerializer {
-        fn serialize(&self, _batch: RecordBatch, _initial: bool) -> Result<Bytes> {
-            Ok(self.bytes.clone())
-        }
     }
 }

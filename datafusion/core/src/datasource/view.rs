@@ -17,22 +17,27 @@
 
 //! View data source which uses a LogicalPlan as it's input.
 
-use std::{any::Any, sync::Arc};
-
-use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
-use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use crate::{
     error::Result,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
 };
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion_catalog::Session;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::Column;
+use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use datafusion_optimizer::analyzer::expand_wildcard_rule::ExpandWildcardRule;
+use datafusion_optimizer::analyzer::type_coercion::TypeCoercion;
+use datafusion_optimizer::Analyzer;
 
 use crate::datasource::{TableProvider, TableType};
-use crate::execution::context::SessionState;
 
 /// An implementation of `TableProvider` that uses another logical plan.
+#[derive(Debug)]
 pub struct ViewTable {
     /// LogicalPlan of the view
     logical_plan: LogicalPlan,
@@ -49,6 +54,7 @@ impl ViewTable {
         logical_plan: LogicalPlan,
         definition: Option<String>,
     ) -> Result<Self> {
+        let logical_plan = Self::apply_required_rule(logical_plan)?;
         let table_schema = logical_plan.schema().as_ref().to_owned().into();
 
         let view = Self {
@@ -58,6 +64,15 @@ impl ViewTable {
         };
 
         Ok(view)
+    }
+
+    fn apply_required_rule(logical_plan: LogicalPlan) -> Result<LogicalPlan> {
+        let options = ConfigOptions::default();
+        Analyzer::with_rules(vec![
+            Arc::new(ExpandWildcardRule::new()),
+            Arc::new(TypeCoercion::new()),
+        ])
+        .execute_and_check(logical_plan, &options, |_, _| {})
     }
 
     /// Get definition ref
@@ -77,8 +92,8 @@ impl TableProvider for ViewTable {
         self
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        Some(&self.logical_plan)
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        Some(Cow::Borrowed(&self.logical_plan))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -92,18 +107,17 @@ impl TableProvider for ViewTable {
     fn get_table_definition(&self) -> Option<&str> {
         self.definition.as_deref()
     }
-
-    fn supports_filter_pushdown(
+    fn supports_filters_pushdown(
         &self,
-        _filter: &Expr,
-    ) -> Result<TableProviderFilterPushDown> {
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A filter is added on the View when given
-        Ok(TableProviderFilterPushDown::Exact)
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -126,9 +140,9 @@ impl TableProvider for ViewTable {
                 let fields: Vec<Expr> = projection
                     .iter()
                     .map(|i| {
-                        Expr::Column(
-                            self.logical_plan.schema().field(*i).qualified_column(),
-                        )
+                        Expr::Column(Column::from(
+                            self.logical_plan.schema().qualified_field(*i),
+                        ))
                     })
                     .collect();
                 plan.project(fields)?
@@ -158,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_3242() -> Result<()> {
-        // regression test for https://github.com/apache/arrow-datafusion/pull/3242
+        // regression test for https://github.com/apache/datafusion/pull/3242
         let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
@@ -232,6 +246,26 @@ mod tests {
 
         assert_batches_eq!(expected, &results);
 
+        let view_sql =
+            "CREATE VIEW replace_xyz AS SELECT * REPLACE (column1*2 as column1) FROM xyz";
+        session_ctx.sql(view_sql).await?.collect().await?;
+
+        let results = session_ctx
+            .sql("SELECT * FROM replace_xyz")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+---------+---------+---------+",
+            "| column1 | column2 | column3 |",
+            "+---------+---------+---------+",
+            "| 2       | 2       | 3       |",
+            "| 8       | 5       | 6       |",
+            "+---------+---------+---------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
         Ok(())
     }
 
@@ -470,11 +504,12 @@ mod tests {
             .select_columns(&["bool_col", "int_col"])?;
 
         let plan = df.explain(false, false)?.collect().await?;
-        // Limit is included in ParquetExec
+        // Limit is included in DataSourceExec
         let formatted = arrow::util::pretty::pretty_format_batches(&plan)
             .unwrap()
             .to_string();
-        assert!(formatted.contains("ParquetExec: "));
+        assert!(formatted.contains("DataSourceExec: "));
+        assert!(formatted.contains("file_type=parquet"));
         assert!(formatted.contains("projection=[bool_col, int_col], limit=10"));
         Ok(())
     }

@@ -163,6 +163,49 @@ fn criterion_benchmark(c: &mut Criterion) {
             )
         })
     });
+
+    c.bench_function("aggregate_query_distinct_median", |b| {
+        b.iter(|| {
+            query(
+                ctx.clone(),
+                "SELECT MEDIAN(DISTINCT u64_wide), MEDIAN(DISTINCT u64_narrow) \
+                 FROM t",
+            )
+        })
+    });
+
+    c.bench_function("first_last_many_columns", |b| {
+        b.iter(|| {
+            query(
+                ctx.clone(),
+                "SELECT first_value(u64_wide order by f64, u64_narrow, utf8),\
+                            last_value(u64_wide order by f64, u64_narrow, utf8)  \
+                 FROM t GROUP BY u64_narrow",
+            )
+        })
+    });
+
+    c.bench_function("first_last_ignore_nulls", |b| {
+        b.iter(|| {
+            query(
+                ctx.clone(),
+                "SELECT first_value(u64_wide ignore nulls order by f64, u64_narrow, utf8),  \
+                            last_value(u64_wide ignore nulls order by f64, u64_narrow, utf8)    \
+                 FROM t GROUP BY u64_narrow",
+            )
+        })
+    });
+
+    c.bench_function("first_last_one_column", |b| {
+        b.iter(|| {
+            query(
+                ctx.clone(),
+                "SELECT first_value(u64_wide order by f64), \
+                            last_value(u64_wide order by f64)   \
+                FROM t GROUP BY u64_narrow",
+            )
+        })
+    });
 }
 
 criterion_group!(benches, criterion_benchmark);

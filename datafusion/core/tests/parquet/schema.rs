@@ -18,7 +18,6 @@
 //! Tests for parquet schema handling
 use std::{collections::HashMap, fs, path::Path};
 
-use ::parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use super::*;
@@ -26,7 +25,7 @@ use datafusion_common::assert_batches_sorted_eq;
 
 #[tokio::test]
 async fn schema_merge_ignores_metadata_by_default() {
-    // Create several parquet files in same directoty / table with
+    // Create several parquet files in same directory / table with
     // same schema but different metadata
     let tmp_dir = TempDir::new().unwrap();
     let table_dir = tmp_dir.path().join("parquet_test");
@@ -104,7 +103,7 @@ async fn schema_merge_ignores_metadata_by_default() {
 
 #[tokio::test]
 async fn schema_merge_can_preserve_metadata() {
-    // Create several parquet files in same directoty / table with
+    // Create several parquet files in same directory / table with
     // same schema but different metadata
     let tmp_dir = TempDir::new().unwrap();
     let table_dir = tmp_dir.path().join("parquet_test");
@@ -148,6 +147,10 @@ async fn schema_merge_can_preserve_metadata() {
         .read_parquet(&table_path, options.clone())
         .await
         .unwrap();
+
+    let actual = df.schema().metadata();
+    assert_eq!(actual.clone(), expected_metadata,);
+
     let actual = df.collect().await.unwrap();
 
     assert_batches_sorted_eq!(expected, &actual);
@@ -158,13 +161,12 @@ async fn schema_merge_can_preserve_metadata() {
         .await
         .unwrap();
 
-    let actual = ctx
-        .sql("SELECT * from t")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT * from t").await.unwrap();
+
+    let actual = df.schema().metadata();
+    assert_eq!(actual.clone(), expected_metadata);
+
+    let actual = df.collect().await.unwrap();
     assert_batches_sorted_eq!(expected, &actual);
     assert_metadata(&actual, &expected_metadata);
 }

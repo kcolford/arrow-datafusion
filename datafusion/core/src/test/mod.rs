@@ -17,34 +17,32 @@
 
 //! Common unit test utility methods
 
-use std::any::Any;
+#![allow(missing_docs)]
+
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::datasource::file_format::file_compression_type::{
-    FileCompressionType, FileTypeExt,
-};
+use crate::datasource::data_source::FileSource;
+use crate::datasource::file_format::csv::CsvFormat;
+use crate::datasource::file_format::file_compression_type::FileCompressionType;
+use crate::datasource::file_format::FileFormat;
 use crate::datasource::listing::PartitionedFile;
 use crate::datasource::object_store::ObjectStoreUrl;
-use crate::datasource::physical_plan::{CsvExec, FileScanConfig};
+use crate::datasource::physical_plan::{CsvSource, FileScanConfig};
 use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
 use crate::logical_expr::LogicalPlan;
-use crate::physical_plan::ExecutionPlan;
 use crate::test::object_store::local_unpartitioned_file;
 use crate::test_util::{aggr_test_schema, arrow_test_data};
 
 use arrow::array::{self, Array, ArrayRef, Decimal128Builder, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{DataFusionError, FileType, Statistics};
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{Partitioning, PhysicalSortExpr};
-use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
-use datafusion_physical_plan::{DisplayAs, DisplayFormatType};
+use datafusion_common::DataFusionError;
+use datafusion_physical_plan::source::DataSourceExec;
 
 #[cfg(feature = "compression")]
 use bzip2::write::BzEncoder;
@@ -65,9 +63,9 @@ pub fn create_table_dual() -> Arc<dyn TableProvider> {
         Field::new("name", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
-        dual_schema.clone(),
+        Arc::<Schema>::clone(&dual_schema),
         vec![
-            Arc::new(array::Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![1])),
             Arc::new(array::StringArray::from(vec!["a"])),
         ],
     )
@@ -76,8 +74,11 @@ pub fn create_table_dual() -> Arc<dyn TableProvider> {
     Arc::new(provider)
 }
 
-/// Returns a [`CsvExec`] that scans "aggregate_test_100.csv" with `partitions` partitions
-pub fn scan_partitioned_csv(partitions: usize, work_dir: &Path) -> Result<Arc<CsvExec>> {
+/// Returns a [`DataSourceExec`] that scans "aggregate_test_100.csv" with `partitions` partitions
+pub fn scan_partitioned_csv(
+    partitions: usize,
+    work_dir: &Path,
+) -> Result<Arc<DataSourceExec>> {
     let schema = aggr_test_schema();
     let filename = "aggregate_test_100.csv";
     let path = format!("{}/csv", arrow_test_data());
@@ -85,19 +86,36 @@ pub fn scan_partitioned_csv(partitions: usize, work_dir: &Path) -> Result<Arc<Cs
         path.as_str(),
         filename,
         partitions,
-        FileType::CSV,
+        Arc::new(CsvFormat::default()),
         FileCompressionType::UNCOMPRESSED,
         work_dir,
     )?;
-    let config = partitioned_csv_config(schema, file_groups)?;
-    Ok(Arc::new(CsvExec::new(
-        config,
-        true,
-        b',',
-        b'"',
-        None,
-        FileCompressionType::UNCOMPRESSED,
-    )))
+    let source = Arc::new(CsvSource::new(true, b'"', b'"'));
+    let config = partitioned_csv_config(schema, file_groups, source)
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED);
+    Ok(config.new_exec())
+}
+
+/// Auto finish the wrapped BzEncoder on drop
+#[cfg(feature = "compression")]
+struct AutoFinishBzEncoder<W: Write>(BzEncoder<W>);
+
+#[cfg(feature = "compression")]
+impl<W: Write> Write for AutoFinishBzEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(feature = "compression")]
+impl<W: Write> Drop for AutoFinishBzEncoder<W> {
+    fn drop(&mut self) {
+        let _ = self.0.try_finish();
+    }
 }
 
 /// Returns file groups [`Vec<Vec<PartitionedFile>>`] for scanning `partitions` of `filename`
@@ -105,7 +123,7 @@ pub fn partitioned_file_groups(
     path: &str,
     filename: &str,
     partitions: usize,
-    file_type: FileType,
+    file_format: Arc<dyn FileFormat>,
     file_compression_type: FileCompressionType,
     work_dir: &Path,
 ) -> Result<Vec<Vec<PartitionedFile>>> {
@@ -117,9 +135,8 @@ pub fn partitioned_file_groups(
         let filename = format!(
             "partition-{}{}",
             i,
-            file_type
-                .to_owned()
-                .get_ext_with_compression(file_compression_type.to_owned())
+            file_format
+                .get_ext_with_compression(&file_compression_type)
                 .unwrap()
         );
         let filename = work_dir.join(filename);
@@ -142,9 +159,10 @@ pub fn partitioned_file_groups(
                 Box::new(encoder)
             }
             #[cfg(feature = "compression")]
-            FileCompressionType::BZIP2 => {
-                Box::new(BzEncoder::new(file, BzCompression::default()))
-            }
+            FileCompressionType::BZIP2 => Box::new(AutoFinishBzEncoder(BzEncoder::new(
+                file,
+                BzCompression::default(),
+            ))),
             #[cfg(not(feature = "compression"))]
             FileCompressionType::GZIP
             | FileCompressionType::BZIP2
@@ -164,7 +182,7 @@ pub fn partitioned_file_groups(
     for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
 
-        if i == 0 && file_type == FileType::CSV {
+        if i == 0 && file_format.get_ext() == CsvFormat::default().get_ext() {
             // write header to all partitions
             for w in writers.iter_mut() {
                 w.write_all(line.as_bytes()).unwrap();
@@ -178,8 +196,8 @@ pub fn partitioned_file_groups(
         }
     }
 
-    // Must drop the stream before creating ObjectMeta below as drop
-    // triggers finish for ZstdEncoder which writes additional data
+    // Must drop the stream before creating ObjectMeta below as drop triggers
+    // finish for ZstdEncoder/BzEncoder which writes additional data
     for mut w in writers.into_iter() {
         w.flush().unwrap();
     }
@@ -194,17 +212,10 @@ pub fn partitioned_file_groups(
 pub fn partitioned_csv_config(
     schema: SchemaRef,
     file_groups: Vec<Vec<PartitionedFile>>,
-) -> Result<FileScanConfig> {
-    Ok(FileScanConfig {
-        object_store_url: ObjectStoreUrl::local_filesystem(),
-        file_schema: schema.clone(),
-        file_groups,
-        statistics: Statistics::new_unknown(&schema),
-        projection: None,
-        limit: None,
-        table_partition_cols: vec![],
-        output_ordering: vec![],
-    })
+    source: Arc<dyn FileSource>,
+) -> FileScanConfig {
+    FileScanConfig::new(ObjectStoreUrl::local_filesystem(), schema, source)
+        .with_file_groups(file_groups)
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -231,7 +242,7 @@ pub fn table_with_sequence(
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
     let arr = Arc::new(Int32Array::from((seq_start..=seq_end).collect::<Vec<_>>()));
     let partitions = vec![vec![RecordBatch::try_new(
-        schema.clone(),
+        Arc::<Schema>::clone(&schema),
         vec![arr as ArrayRef],
     )?]];
     Ok(Arc::new(MemTable::try_new(schema, partitions)?))
@@ -271,172 +282,6 @@ fn make_decimal() -> RecordBatch {
         .unwrap();
     let schema = Schema::new(vec![Field::new("c1", array.data_type().clone(), true)]);
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap()
-}
-
-/// Created a sorted Csv exec
-pub fn csv_exec_sorted(
-    schema: &SchemaRef,
-    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
-) -> Arc<dyn ExecutionPlan> {
-    let sort_exprs = sort_exprs.into_iter().collect();
-
-    Arc::new(CsvExec::new(
-        FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-            file_schema: schema.clone(),
-            file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
-            statistics: Statistics::new_unknown(schema),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![sort_exprs],
-        },
-        false,
-        0,
-        0,
-        None,
-        FileCompressionType::UNCOMPRESSED,
-    ))
-}
-
-// construct a stream partition for test purposes
-pub(crate) struct TestStreamPartition {
-    pub schema: SchemaRef,
-}
-
-impl PartitionStream for TestStreamPartition {
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-        unreachable!()
-    }
-}
-
-/// Create an unbounded stream exec
-pub fn stream_exec_ordered(
-    schema: &SchemaRef,
-    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
-) -> Arc<dyn ExecutionPlan> {
-    let sort_exprs = sort_exprs.into_iter().collect();
-
-    Arc::new(
-        StreamingTableExec::try_new(
-            schema.clone(),
-            vec![Arc::new(TestStreamPartition {
-                schema: schema.clone(),
-            }) as _],
-            None,
-            vec![sort_exprs],
-            true,
-        )
-        .unwrap(),
-    )
-}
-
-/// Create a csv exec for tests
-pub fn csv_exec_ordered(
-    schema: &SchemaRef,
-    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
-) -> Arc<dyn ExecutionPlan> {
-    let sort_exprs = sort_exprs.into_iter().collect();
-
-    Arc::new(CsvExec::new(
-        FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-            file_schema: schema.clone(),
-            file_groups: vec![vec![PartitionedFile::new("file_path".to_string(), 100)]],
-            statistics: Statistics::new_unknown(schema),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![sort_exprs],
-        },
-        true,
-        0,
-        b'"',
-        None,
-        FileCompressionType::UNCOMPRESSED,
-    ))
-}
-
-/// A mock execution plan that simply returns the provided statistics
-#[derive(Debug, Clone)]
-pub struct StatisticsExec {
-    stats: Statistics,
-    schema: Arc<Schema>,
-}
-impl StatisticsExec {
-    pub fn new(stats: Statistics, schema: Schema) -> Self {
-        assert_eq!(
-            stats.column_statistics.len(), schema.fields().len(),
-            "if defined, the column statistics vector length should be the number of fields"
-        );
-        Self {
-            stats,
-            schema: Arc::new(schema),
-        }
-    }
-}
-
-impl DisplayAs for StatisticsExec {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "StatisticsExec: col_count={}, row_count={:?}",
-                    self.schema.fields().len(),
-                    self.stats.num_rows,
-                )
-            }
-        }
-    }
-}
-
-impl ExecutionPlan for StatisticsExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(2)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        unimplemented!("This plan only serves for testing statistics")
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.stats.clone())
-    }
 }
 
 pub mod object_store;

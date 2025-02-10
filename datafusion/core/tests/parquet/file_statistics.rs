@@ -22,20 +22,42 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::physical_plan::ParquetExec;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_common::stats::Precision;
 use datafusion_execution::cache::cache_manager::CacheManagerConfig;
-use datafusion_execution::cache::cache_unit;
 use datafusion_execution::cache::cache_unit::{
     DefaultFileStatisticsCache, DefaultListFilesCache,
 };
 use datafusion_execution::config::SessionConfig;
-use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+use datafusion_expr::{col, lit, Expr};
+use datafusion_physical_plan::source::DataSourceExec;
 
+use datafusion::datasource::physical_plan::FileScanConfig;
 use tempfile::tempdir;
+
+#[tokio::test]
+async fn check_stats_precision_with_filter_pushdown() {
+    let testdata = datafusion::test_util::parquet_test_data();
+    let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
+    let table_path = ListingTableUrl::parse(filename).unwrap();
+
+    let opt = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let table = get_listing_table(&table_path, None, &opt).await;
+    let (_, _, state) = get_cache_runtime_state();
+    // Scan without filter, stats are exact
+    let exec = table.scan(&state, None, &[], None).await.unwrap();
+    assert_eq!(exec.statistics().unwrap().num_rows, Precision::Exact(8));
+
+    // Scan with filter pushdown, stats are inexact
+    let filter = Expr::gt(col("id"), lit(1));
+
+    let exec = table.scan(&state, None, &[filter], None).await.unwrap();
+    assert_eq!(exec.statistics().unwrap().num_rows, Precision::Inexact(8));
+}
 
 #[tokio::test]
 async fn load_table_stats_with_session_level_cache() {
@@ -128,10 +150,12 @@ async fn list_files_with_session_level_cache() {
     //Session 1 first time list files
     assert_eq!(get_list_file_cache_size(&state1), 0);
     let exec1 = table1.scan(&state1, None, &[], None).await.unwrap();
-    let parquet1 = exec1.as_any().downcast_ref::<ParquetExec>().unwrap();
+    let data_source = exec1.as_any().downcast_ref::<DataSourceExec>().unwrap();
+    let source = data_source.source();
+    let parquet1 = source.as_any().downcast_ref::<FileScanConfig>().unwrap();
 
     assert_eq!(get_list_file_cache_size(&state1), 1);
-    let fg = &parquet1.base_config().file_groups;
+    let fg = &parquet1.file_groups;
     assert_eq!(fg.len(), 1);
     assert_eq!(fg.first().unwrap().len(), 1);
 
@@ -139,10 +163,12 @@ async fn list_files_with_session_level_cache() {
     //check session 1 cache result not show in session 2
     assert_eq!(get_list_file_cache_size(&state2), 0);
     let exec2 = table2.scan(&state2, None, &[], None).await.unwrap();
-    let parquet2 = exec2.as_any().downcast_ref::<ParquetExec>().unwrap();
+    let data_source = exec2.as_any().downcast_ref::<DataSourceExec>().unwrap();
+    let source = data_source.source();
+    let parquet2 = source.as_any().downcast_ref::<FileScanConfig>().unwrap();
 
     assert_eq!(get_list_file_cache_size(&state2), 1);
-    let fg2 = &parquet2.base_config().file_groups;
+    let fg2 = &parquet2.file_groups;
     assert_eq!(fg2.len(), 1);
     assert_eq!(fg2.first().unwrap().len(), 1);
 
@@ -150,10 +176,12 @@ async fn list_files_with_session_level_cache() {
     //check session 1 cache result not show in session 2
     assert_eq!(get_list_file_cache_size(&state1), 1);
     let exec3 = table1.scan(&state1, None, &[], None).await.unwrap();
-    let parquet3 = exec3.as_any().downcast_ref::<ParquetExec>().unwrap();
+    let data_source = exec3.as_any().downcast_ref::<DataSourceExec>().unwrap();
+    let source = data_source.source();
+    let parquet3 = source.as_any().downcast_ref::<FileScanConfig>().unwrap();
 
     assert_eq!(get_list_file_cache_size(&state1), 1);
-    let fg = &parquet3.base_config().file_groups;
+    let fg = &parquet3.file_groups;
     assert_eq!(fg.len(), 1);
     assert_eq!(fg.first().unwrap().len(), 1);
     // List same file no increase
@@ -167,10 +195,7 @@ async fn get_listing_table(
 ) -> ListingTable {
     let schema = opt
         .infer_schema(
-            &SessionState::new_with_config_rt(
-                SessionConfig::default(),
-                Arc::new(RuntimeEnv::default()),
-            ),
+            &SessionStateBuilder::new().with_default_features().build(),
             table_path,
         )
         .await
@@ -192,16 +217,18 @@ fn get_cache_runtime_state() -> (
     SessionState,
 ) {
     let cache_config = CacheManagerConfig::default();
-    let file_static_cache = Arc::new(cache_unit::DefaultFileStatisticsCache::default());
-    let list_file_cache = Arc::new(cache_unit::DefaultListFilesCache::default());
+    let file_static_cache = Arc::new(DefaultFileStatisticsCache::default());
+    let list_file_cache = Arc::new(DefaultListFilesCache::default());
 
     let cache_config = cache_config
         .with_files_statistics_cache(Some(file_static_cache.clone()))
         .with_list_files_cache(Some(list_file_cache.clone()));
 
-    let rt = Arc::new(
-        RuntimeEnv::new(RuntimeConfig::new().with_cache_manager(cache_config)).unwrap(),
-    );
+    let rt = RuntimeEnvBuilder::new()
+        .with_cache_manager(cache_config)
+        .build_arc()
+        .expect("could not build runtime environment");
+
     let state = SessionContext::new_with_config_rt(SessionConfig::default(), rt).state();
 
     (file_static_cache, list_file_cache, state)

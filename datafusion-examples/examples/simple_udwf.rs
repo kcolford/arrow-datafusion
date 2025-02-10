@@ -19,15 +19,13 @@ use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, AsArray, Float64Array},
-    datatypes::Float64Type,
+    datatypes::{DataType, Float64Type},
 };
-use arrow_schema::DataType;
-use datafusion::datasource::file_format::options::CsvReadOptions;
 
+use datafusion::common::ScalarValue;
 use datafusion::error::Result;
+use datafusion::logical_expr::{PartitionEvaluator, Volatility, WindowFrame};
 use datafusion::prelude::*;
-use datafusion_common::ScalarValue;
-use datafusion_expr::{PartitionEvaluator, Volatility, WindowFrame};
 
 // create local execution context with `cars.csv` registered as a table named `cars`
 async fn create_context() -> Result<SessionContext> {
@@ -72,7 +70,7 @@ async fn main() -> Result<()> {
     // creating a new `PartitionEvaluator`)
     //
     // `ORDER BY time`: within each partition ('green' or 'red') the
-    // rows will be be ordered by the value in the `time` column
+    // rows will be ordered by the value in the `time` column
     //
     // `evaluate_inside_range` is invoked with a window defined by the
     // SQL. In this case:
@@ -119,12 +117,12 @@ async fn main() -> Result<()> {
     df.show().await?;
 
     // Now, run the function using the DataFrame API:
-    let window_expr = smooth_it.call(
-        vec![col("speed")],                 // smooth_it(speed)
-        vec![col("car")],                   // PARTITION BY car
-        vec![col("time").sort(true, true)], // ORDER BY time ASC
-        WindowFrame::new(None),
-    );
+    let window_expr = smooth_it
+        .call(vec![col("speed")]) // smooth_it(speed)
+        .partition_by(vec![col("car")]) // PARTITION BY car
+        .order_by(vec![col("time").sort(true, true)]) // ORDER BY time ASC
+        .window_frame(WindowFrame::new(None))
+        .build()?;
     let df = ctx.table("cars").await?.window(vec![window_expr])?;
 
     // print the results
@@ -133,7 +131,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Create a `PartitionEvalutor` to evaluate this function on a new
+/// Create a `PartitionEvaluator` to evaluate this function on a new
 /// partition.
 fn make_partition_evaluator() -> Result<Box<dyn PartitionEvaluator>> {
     Ok(Box::new(MyPartitionEvaluator::new()))

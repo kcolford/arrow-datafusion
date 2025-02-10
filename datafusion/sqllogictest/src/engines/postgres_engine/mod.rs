@@ -15,22 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use datafusion::common::runtime::SpawnedTask;
+use futures::{SinkExt, StreamExt};
+use log::{debug, info};
+use sqllogictest::DBOutput;
 /// Postgres engine implementation for sqllogictest.
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
-use log::debug;
-use sqllogictest::DBOutput;
-use tokio::task::JoinHandle;
+use std::time::Duration;
 
 use super::conversion::*;
 use crate::engines::output::{DFColumnType, DFOutput};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use indicatif::ProgressBar;
 use postgres_types::Type;
 use rust_decimal::Decimal;
+use tokio::time::Instant;
 use tokio_postgres::{Column, Row};
 use types::PgRegtype;
 
@@ -52,9 +54,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Postgres {
     client: tokio_postgres::Client,
-    join_handle: JoinHandle<()>,
+    _spawned_task: SpawnedTask<()>,
     /// Relative test file path
     relative_path: PathBuf,
+    pb: ProgressBar,
 }
 
 impl Postgres {
@@ -71,23 +74,23 @@ impl Postgres {
     /// ```
     ///
     /// See https://docs.rs/tokio-postgres/latest/tokio_postgres/config/struct.Config.html#url for format
-    pub async fn connect(relative_path: PathBuf) -> Result<Self> {
+    pub async fn connect(relative_path: PathBuf, pb: ProgressBar) -> Result<Self> {
         let uri =
             std::env::var("PG_URI").map_or(PG_URI.to_string(), std::convert::identity);
 
-        debug!("Using posgres connection string: {uri}");
+        info!("Using postgres connection string: {uri}");
 
         let config = tokio_postgres::Config::from_str(&uri)?;
 
         // hint to user what the connection string was
         let res = config.connect(tokio_postgres::NoTls).await;
         if res.is_err() {
-            eprintln!("Error connecting to posgres using PG_URI={uri}");
+            eprintln!("Error connecting to postgres using PG_URI={uri}");
         };
 
         let (client, connection) = res?;
 
-        let join_handle = tokio::spawn(async move {
+        let _spawned_task = SpawnedTask::spawn(async move {
             if let Err(e) = connection.await {
                 log::error!("Postgres connection error: {:?}", e);
             }
@@ -111,8 +114,9 @@ impl Postgres {
 
         Ok(Self {
             client,
-            join_handle,
+            _spawned_task,
             relative_path,
+            pb,
         })
     }
 
@@ -181,6 +185,22 @@ impl Postgres {
         tx.commit().await?;
         Ok(DBOutput::StatementComplete(0))
     }
+
+    fn update_slow_count(&self) {
+        let msg = self.pb.message();
+        let split: Vec<&str> = msg.split(" ").collect();
+        let mut current_count = 0;
+
+        if split.len() > 2 {
+            // second match will be current slow count
+            current_count += split[2].parse::<i32>().unwrap();
+        }
+
+        current_count += 1;
+
+        self.pb
+            .set_message(format!("{} - {} took > 500 ms", split[0], current_count));
+    }
 }
 
 /// remove single quotes from the start and end of the string
@@ -194,22 +214,12 @@ fn no_quotes(t: &str) -> &str {
 /// return a schema name
 fn schema_name(relative_path: &Path) -> String {
     relative_path
-        .file_name()
-        .map(|name| {
-            name.to_string_lossy()
-                .chars()
-                .filter(|ch| ch.is_ascii_alphabetic())
-                .collect::<String>()
-                .trim_start_matches("pg_")
-                .to_string()
-        })
-        .unwrap_or_else(|| "default_schema".to_string())
-}
-
-impl Drop for Postgres {
-    fn drop(&mut self) {
-        self.join_handle.abort()
-    }
+        .to_string_lossy()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .trim_start_matches("pg_")
+        .to_string()
 }
 
 #[async_trait]
@@ -221,7 +231,7 @@ impl sqllogictest::AsyncDB for Postgres {
         &mut self,
         sql: &str,
     ) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        println!(
+        debug!(
             "[{}] Running query: \"{}\"",
             self.relative_path.display(),
             sql
@@ -242,14 +252,24 @@ impl sqllogictest::AsyncDB for Postgres {
         };
 
         if lower_sql.starts_with("copy") {
+            self.pb.inc(1);
             return self.run_copy_command(sql).await;
         }
 
         if !is_query_sql {
             self.client.execute(sql, &[]).await?;
+            self.pb.inc(1);
             return Ok(DBOutput::StatementComplete(0));
         }
+        let start = Instant::now();
         let rows = self.client.query(sql, &[]).await?;
+        let duration = start.elapsed();
+
+        if duration.gt(&Duration::from_millis(500)) {
+            self.update_slow_count();
+        }
+
+        self.pb.inc(1);
 
         let types: Vec<Type> = if rows.is_empty() {
             self.client

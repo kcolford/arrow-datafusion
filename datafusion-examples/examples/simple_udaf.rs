@@ -20,10 +20,9 @@
 use datafusion::arrow::{
     array::ArrayRef, array::Float32Array, datatypes::DataType, record_batch::RecordBatch,
 };
+use datafusion::common::cast::as_float64_array;
 use datafusion::{error::Result, physical_plan::Accumulator};
 use datafusion::{logical_expr::Volatility, prelude::*, scalar::ScalarValue};
-use datafusion_common::cast::as_float64_array;
-use datafusion_expr::create_udaf;
 use std::sync::Arc;
 
 // create local session context with an in-memory table
@@ -132,7 +131,7 @@ impl Accumulator for GeometricMean {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of_val(self)
+        size_of_val(self)
     }
 }
 

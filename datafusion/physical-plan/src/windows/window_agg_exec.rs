@@ -22,8 +22,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::common::transpose;
-use crate::expressions::PhysicalSortExpr;
+use super::utils::create_schema;
+use crate::execution_plan::EmissionType;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::windows::{
     calc_requirements, get_ordered_partition_by_indices, get_partition_by_sort_exprs,
@@ -31,29 +31,25 @@ use crate::windows::{
 };
 use crate::{
     ColumnStatistics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    Partitioning, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream, Statistics,
-    WindowExpr,
+    ExecutionPlanProperties, PhysicalExpr, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics, WindowExpr,
 };
 
+use arrow::array::ArrayRef;
 use arrow::compute::{concat, concat_batches};
-use arrow::datatypes::SchemaBuilder;
+use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use arrow::{
-    array::ArrayRef,
-    datatypes::{Schema, SchemaRef},
-    record_batch::RecordBatch,
-};
+use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
-use datafusion_common::utils::evaluate_partition_ranges;
-use datafusion_common::{internal_err, plan_err, DataFusionError, Result};
+use datafusion_common::utils::{evaluate_partition_ranges, transpose};
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 
-use futures::stream::Stream;
-use futures::{ready, StreamExt};
+use futures::{ready, Stream, StreamExt};
 
 /// Window execution plan
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WindowAggExec {
     /// Input plan
     pub(crate) input: Arc<dyn ExecutionPlan>,
@@ -61,13 +57,15 @@ pub struct WindowAggExec {
     window_expr: Vec<Arc<dyn WindowExpr>>,
     /// Schema after the window is run
     schema: SchemaRef,
-    /// Partition Keys
-    pub partition_keys: Vec<Arc<dyn PhysicalExpr>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Partition by indices that defines preset for existing ordering
     // see `get_ordered_partition_by_indices` for more details.
     ordered_partition_by_indices: Vec<usize>,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
+    /// If `can_partition` is false, partition_keys is always empty.
+    can_repartition: bool,
 }
 
 impl WindowAggExec {
@@ -75,20 +73,22 @@ impl WindowAggExec {
     pub fn try_new(
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: Arc<dyn ExecutionPlan>,
-        partition_keys: Vec<Arc<dyn PhysicalExpr>>,
+        can_repartition: bool,
     ) -> Result<Self> {
         let schema = create_schema(&input.schema(), &window_expr)?;
         let schema = Arc::new(schema);
 
         let ordered_partition_by_indices =
             get_ordered_partition_by_indices(window_expr[0].partition_by(), &input);
+        let cache = Self::compute_properties(Arc::clone(&schema), &input, &window_expr);
         Ok(Self {
             input,
             window_expr,
             schema,
-            partition_keys,
             metrics: ExecutionPlanMetricsSet::new(),
             ordered_partition_by_indices,
+            cache,
+            can_repartition,
         })
     }
 
@@ -107,13 +107,54 @@ impl WindowAggExec {
     // We are sure that partition by columns are always at the beginning of sort_keys
     // Hence returned `PhysicalSortExpr` corresponding to `PARTITION BY` columns can be used safely
     // to calculate partition separation points
-    pub fn partition_by_sort_keys(&self) -> Result<Vec<PhysicalSortExpr>> {
+    pub fn partition_by_sort_keys(&self) -> Result<LexOrdering> {
         let partition_by = self.window_expr()[0].partition_by();
         get_partition_by_sort_exprs(
             &self.input,
             partition_by,
             &self.ordered_partition_by_indices,
         )
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        schema: SchemaRef,
+        input: &Arc<dyn ExecutionPlan>,
+        window_exprs: &[Arc<dyn WindowExpr>],
+    ) -> PlanProperties {
+        // Calculate equivalence properties:
+        let eq_properties = window_equivalence_properties(&schema, input, window_exprs);
+
+        // Get output partitioning:
+        // Because we can have repartitioning using the partition keys this
+        // would be either 1 or more than 1 depending on the presence of repartitioning.
+        let output_partitioning = input.output_partitioning().clone();
+
+        // Construct properties cache:
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            // TODO: Emission type and boundedness information can be enhanced here
+            EmissionType::Final,
+            input.boundedness(),
+        )
+    }
+
+    pub fn partition_keys(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        if !self.can_repartition {
+            vec![]
+        } else {
+            let all_partition_keys = self
+                .window_expr()
+                .iter()
+                .map(|expr| expr.partition_by().to_vec())
+                .collect::<Vec<_>>();
+
+            all_partition_keys
+                .into_iter()
+                .min_by_key(|s| s.len())
+                .unwrap_or_else(Vec::new)
+        }
     }
 }
 
@@ -146,73 +187,47 @@ impl DisplayAs for WindowAggExec {
 }
 
 impl ExecutionPlan for WindowAggExec {
+    fn name(&self) -> &'static str {
+        "WindowAggExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        // because we can have repartitioning using the partition keys
-        // this would be either 1 or more than 1 depending on the presense of
-        // repartitioning
-        self.input.output_partitioning()
-    }
-
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        if children[0] {
-            plan_err!(
-                "Window Error: Windowing is not currently support for unbounded inputs."
-            )
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input().output_ordering()
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         let partition_bys = self.window_expr()[0].partition_by();
         let order_keys = self.window_expr()[0].order_by();
         if self.ordered_partition_by_indices.len() < partition_bys.len() {
-            vec![calc_requirements(partition_bys, order_keys)]
+            vec![calc_requirements(partition_bys, order_keys.iter())]
         } else {
             let partition_bys = self
                 .ordered_partition_by_indices
                 .iter()
                 .map(|idx| &partition_bys[*idx]);
-            vec![calc_requirements(partition_bys, order_keys)]
+            vec![calc_requirements(partition_bys, order_keys.iter())]
         }
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.partition_keys.is_empty() {
+        if self.partition_keys().is_empty() {
             vec![Distribution::SinglePartition]
         } else {
-            vec![Distribution::HashPartitioned(self.partition_keys.clone())]
+            vec![Distribution::HashPartitioned(self.partition_keys())]
         }
-    }
-
-    /// Get the [`EquivalenceProperties`] within the plan
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        window_equivalence_properties(&self.schema, &self.input, &self.window_expr)
     }
 
     fn with_new_children(
@@ -221,8 +236,8 @@ impl ExecutionPlan for WindowAggExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(WindowAggExec::try_new(
             self.window_expr.clone(),
-            children[0].clone(),
-            self.partition_keys.clone(),
+            Arc::clone(&children[0]),
+            true,
         )?))
     }
 
@@ -233,7 +248,7 @@ impl ExecutionPlan for WindowAggExec {
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
         let stream = Box::pin(WindowAggStream::new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             self.window_expr.clone(),
             input,
             BaselineMetrics::new(&self.metrics, partition),
@@ -266,20 +281,6 @@ impl ExecutionPlan for WindowAggExec {
     }
 }
 
-fn create_schema(
-    input_schema: &Schema,
-    window_expr: &[Arc<dyn WindowExpr>],
-) -> Result<Schema> {
-    let capacity = input_schema.fields().len() + window_expr.len();
-    let mut builder = SchemaBuilder::with_capacity(capacity);
-    builder.extend(input_schema.fields().iter().cloned());
-    // append results to the schema
-    for expr in window_expr {
-        builder.push(expr.field()?);
-    }
-    Ok(builder.finish())
-}
-
 /// Compute the window aggregate columns
 fn compute_window_aggregates(
     window_expr: &[Arc<dyn WindowExpr>],
@@ -298,7 +299,7 @@ pub struct WindowAggStream {
     batches: Vec<RecordBatch>,
     finished: bool,
     window_expr: Vec<Arc<dyn WindowExpr>>,
-    partition_by_sort_keys: Vec<PhysicalSortExpr>,
+    partition_by_sort_keys: LexOrdering,
     baseline_metrics: BaselineMetrics,
     ordered_partition_by_indices: Vec<usize>,
 }
@@ -310,7 +311,7 @@ impl WindowAggStream {
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: SendableRecordBatchStream,
         baseline_metrics: BaselineMetrics,
-        partition_by_sort_keys: Vec<PhysicalSortExpr>,
+        partition_by_sort_keys: LexOrdering,
         ordered_partition_by_indices: Vec<usize>,
     ) -> Result<Self> {
         // In WindowAggExec all partition by columns should be ordered.
@@ -329,12 +330,13 @@ impl WindowAggStream {
         })
     }
 
-    fn compute_aggregates(&self) -> Result<RecordBatch> {
+    fn compute_aggregates(&self) -> Result<Option<RecordBatch>> {
         // record compute time on drop
         let _timer = self.baseline_metrics.elapsed_compute().timer();
+
         let batch = concat_batches(&self.input.schema(), &self.batches)?;
         if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(self.schema.clone()));
+            return Ok(None);
         }
 
         let partition_by_sort_keys = self
@@ -367,7 +369,10 @@ impl WindowAggStream {
         let mut batch_columns = batch.columns().to_vec();
         // calculate window cols
         batch_columns.extend_from_slice(&columns);
-        Ok(RecordBatch::try_new(self.schema.clone(), batch_columns)?)
+        Ok(Some(RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            batch_columns,
+        )?))
     }
 }
 
@@ -394,18 +399,23 @@ impl WindowAggStream {
         }
 
         loop {
-            let result = match ready!(self.input.poll_next_unpin(cx)) {
+            return Poll::Ready(Some(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
                     self.batches.push(batch);
                     continue;
                 }
                 Some(Err(e)) => Err(e),
-                None => self.compute_aggregates(),
-            };
-
-            self.finished = true;
-
-            return Poll::Ready(Some(result));
+                None => {
+                    let Some(result) = self.compute_aggregates()? else {
+                        return Poll::Ready(None);
+                    };
+                    self.finished = true;
+                    // Empty record batches should not be emitted.
+                    // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
+                    debug_assert!(result.num_rows() > 0);
+                    Ok(result)
+                }
+            }));
         }
     }
 }
@@ -413,6 +423,6 @@ impl WindowAggStream {
 impl RecordBatchStream for WindowAggStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
